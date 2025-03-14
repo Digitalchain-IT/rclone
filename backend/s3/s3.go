@@ -2965,6 +2965,11 @@ type Options struct {
 	IBMInstanceID         string               `config:"ibm_resource_instance_id"`
 	UseXID                fs.Tristate          `config:"use_x_id"`
 	SignAcceptEncoding    fs.Tristate          `config:"sign_accept_encoding"`
+	//Added by Marwan Zakhia
+	DCAuthURL    string `config:"dc_auth_url"`
+	DCFoldersURL string `config:"dc_folders_url"`
+	DCUser       string `config:"dc_user"`
+	DCPass       string `config:"dc_pass"`
 }
 
 // Fs represents a remote s3 server
@@ -2986,6 +2991,7 @@ type Fs struct {
 	versioningMu   sync.Mutex
 	versioning     fs.Tristate // if set bucket is using versions
 	warnCompressed sync.Once   // warn once about compressed files
+	permHelper     *Helper     //Added by MZ to check the permission on AWS and OCI
 }
 
 // Object describes a s3 object
@@ -3755,16 +3761,23 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// retry directory listings after XMLSyntaxError
 	pc.SetRetries(2)
 
+	//Added by MZ
+	permHelper, err := NewHelperFromConfig(m)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init permission helper: %w", err)
+	}
+
 	f := &Fs{
-		name:    name,
-		opt:     *opt,
-		ci:      ci,
-		ctx:     ctx,
-		c:       c,
-		pacer:   pc,
-		cache:   bucket.NewCache(),
-		srv:     srv,
-		srvRest: rest.NewClient(fshttp.NewClient(ctx)),
+		name:       name,
+		opt:        *opt,
+		ci:         ci,
+		ctx:        ctx,
+		c:          c,
+		pacer:      pc,
+		cache:      bucket.NewCache(),
+		srv:        srv,
+		permHelper: permHelper, //Added by MZ
+		srvRest:    rest.NewClient(fshttp.NewClient(ctx)),
 	}
 	if opt.ServerSideEncryption == "aws:kms" || opt.SSECustomerAlgorithm != "" {
 		// From: https://docs.aws.amazon.com/AmazonS3/latest/API/RESTCommonResponseHeaders.html
@@ -3816,6 +3829,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.features.OpenChunkWriter = nil
 	}
 
+	// Added by Marwan Zakhia
+	if f.rootBucket != "" {
+		err = f.permHelper.CheckPermission(ctx, "list", f.rootBucket, f.rootDirectory)
+		if err != nil {
+			return nil, fmt.Errorf("permission denied for %q/%q: %w", f.rootBucket, f.rootDirectory, err)
+		}
+	}
+
 	if f.rootBucket != "" && f.rootDirectory != "" && !opt.NoHeadObject && !strings.HasSuffix(root, "/") {
 		// Check to see if the (bucket,directory) is actually an existing file
 		oldRoot := f.root
@@ -3827,6 +3848,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			f.setRoot(oldRoot)
 			return f, nil
 		}
+
 		// return an error with an fs which points to the parent
 		return f, fs.ErrorIsFile
 	}
@@ -4286,6 +4308,24 @@ func (f *Fs) list(ctx context.Context, opt listOpt, fn listFn) error {
 	if !opt.recurse {
 		delimiter = "/"
 	}
+
+	//Added by MZ
+	// ---------------------------------------------------------
+	// 2) Derive the "folderPath" for permission checking
+	//    e.g. if you want "directory + prefix" or just "directory".
+	//    This depends on how your microservice wants the path.
+	folderPath := path.Join(opt.directory, opt.prefix)
+	// Typically, both `opt.directory` and `opt.prefix` may have trailing "/"
+	// so you might want to strip or unify them:
+	folderPath = strings.TrimSuffix(folderPath, "/")
+
+	// 3) Call CheckPermission
+	//    The action is "list" because that's what `list(...)` is doing
+	//    The bucket is `opt.bucket`
+	if err := f.permHelper.CheckPermission(ctx, "list", opt.bucket, folderPath); err != nil {
+		return err
+	}
+
 	// URL encode the listings so we can use control characters in object names
 	// See: https://github.com/aws/aws-sdk-go/issues/1914
 	//
@@ -4622,6 +4662,18 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		fs:     f,
 		remote: src.Remote(),
 	}
+
+	//Added by MZ
+	// 2) Derive the path for permission checks.
+	//    If you typically do f.rootDirectory + o.remote, or just o.remote, do so here.
+	folderPath := path.Join(f.rootDirectory, fs.remote)
+	folderPath = strings.Trim(folderPath, "/") // if needed
+
+	// 3) Check permission for "put"
+	if err := f.permHelper.CheckPermission(ctx, "put", f.rootBucket, folderPath); err != nil {
+		return nil, err
+	}
+
 	return fs, fs.Update(ctx, in, src, options...)
 }
 
