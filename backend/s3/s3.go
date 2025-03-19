@@ -2966,10 +2966,21 @@ type Options struct {
 	UseXID                fs.Tristate          `config:"use_x_id"`
 	SignAcceptEncoding    fs.Tristate          `config:"sign_accept_encoding"`
 	//Added by Marwan Zakhia
-	DCAuthURL    string `config:"dc_auth_url"`
-	DCFoldersURL string `config:"dc_folders_url"`
-	DCUser       string `config:"dc_user"`
-	DCPass       string `config:"dc_pass"`
+	DCAuthURL          string `config:"dc_auth_url"`
+	DCFoldersURL       string `config:"dc_folders_url"`
+	DCUser             string `config:"dc_user"`
+	DCPass             string `config:"dc_pass"`
+	DCUserID           string `config:"dc_user_id"`
+	DCPermURL          string `config:"dc_perm_url"`
+	EnableLogs         bool   `config:"dc_enable_logs"`       // toggle logs on/off
+	DCFolderCreateURL  string `config:"dc_folder_create_url"` // e.g. http://server:8222/api/folders/create
+	DCFolderDeleteURL  string `config:"dc_folder_delete_url"` // e.g. http://server:8222/api/folders
+	DCPrivateFolderURL string `config:"dc_private_folder_url"`
+
+	// NOTE: Below fields are needed because your code calls them:
+	DCFolderRenameURL string `config:"dc_folder_rename_url"` // e.g. http://localhost:8222/api/folders
+	DCFolderMoveURL   string `config:"dc_folder_move_url"`   // e.g. http://localhost:8222/api/folders
+	DCFolderCopyURL   string `config:"dc_folder_copy_url"`   // e.g. http://localhost:8222/api/folders
 }
 
 // Fs represents a remote s3 server
@@ -3761,7 +3772,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// retry directory listings after XMLSyntaxError
 	pc.SetRetries(2)
 
-	//Added by MZ
+	//Added by Marwan Zakhia
 	permHelper, err := NewHelperFromConfig(m)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init permission helper: %w", err)
@@ -4748,14 +4759,57 @@ func (f *Fs) createDirectoryMarker(ctx context.Context, bucket, dir string) erro
 	return nil
 }
 
+//Updated by Marwan Zakhia
 // Mkdir creates the bucket if it doesn't exist
-func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+
+//Comment the current code
+/*func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	bucket, _ := f.split(dir)
 	e := f.makeBucket(ctx, bucket)
 	if e != nil {
 		return e
 	}
 	return f.createDirectoryMarker(ctx, bucket, dir)
+}*/
+
+//add the updated function (by MZ 18/03/2025)
+// Mkdir creates the bucket if it doesn't exist, then creates a directory marker.
+
+// Mkdir creates the directory marker in your S3 logic.
+func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	// 1) Log that Mkdir was called
+	fs.Debugf(f, "[Mkdir] Called => dir=%q", dir)
+
+	// 2) Split the dir into bucket + folder path
+	bucket, folderPath := f.split(dir)
+	fs.Debugf(f, "[Mkdir] => bucket=%q folderPath=%q", bucket, folderPath)
+
+	// 3) Check permission with "put" action
+	fs.Debugf(f, "[Mkdir] => calling CheckPermission(action=%q, bucket=%q, path=%q)",
+		"put", bucket, folderPath)
+	if err := f.permHelper.CheckPermission(ctx, "put", bucket, folderPath); err != nil {
+		fs.Errorf(f, "[Mkdir] => CheckPermission DENIED => %v", err)
+		return err
+	}
+	fs.Debugf(f, "[Mkdir] => CheckPermission ALLOWED for action='put'")
+
+	// 4) Ensure the bucket exists
+	fs.Debugf(f, "[Mkdir] => calling makeBucket(bucket=%q)", bucket)
+	if err := f.makeBucket(ctx, bucket); err != nil {
+		fs.Errorf(f, "[Mkdir] => makeBucket FAILED => %v", err)
+		return err
+	}
+	fs.Debugf(f, "[Mkdir] => makeBucket SUCCESS for bucket=%q", bucket)
+
+	// 5) Create directory marker object if desired
+	fs.Debugf(f, "[Mkdir] => createDirectoryMarker => dir=%q", dir)
+	if err := f.createDirectoryMarker(ctx, bucket, dir); err != nil {
+		fs.Errorf(f, "[Mkdir] => createDirectoryMarker FAILED => %v", err)
+		return err
+	}
+
+	fs.Debugf(f, "[Mkdir] => SUCCESS => dir=%q bucket=%q folderPath=%q", dir, bucket, folderPath)
+	return nil
 }
 
 // mkdirParent creates the parent bucket/directory if it doesn't exist
@@ -4811,10 +4865,13 @@ func (f *Fs) makeBucket(ctx context.Context, bucket string) error {
 	})
 }
 
+// Updated by Marwan Zakhia (18/03/2025)
 // Rmdir deletes the bucket if the fs is at the root
 //
 // Returns an error if it isn't empty
-func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+
+//Comment out the existing code
+/*func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	bucket, directory := f.split(dir)
 	// Remove directory marker file
 	if f.opt.DirectoryMarkers && bucket != "" && dir != "" {
@@ -4831,6 +4888,66 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	if bucket == "" || directory != "" {
 		return nil
 	}
+	return f.cache.Remove(bucket, func() error {
+		req := s3.DeleteBucketInput{
+			Bucket: &bucket,
+		}
+		err := f.pacer.Call(func() (bool, error) {
+			_, err := f.c.DeleteBucket(ctx, &req)
+			return f.shouldRetry(ctx, err)
+		})
+		if err == nil {
+			fs.Infof(f, "Bucket %q deleted", bucket)
+		}
+		return err
+	})
+}*/
+
+// MZ: add the update function
+// Rmdir deletes the bucket if the fs is at the root,
+// or deletes a "directory marker" if we're removing a subfolder.
+//
+// Returns an error if it isn't empty or permission is denied.
+func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	// Split the remote path into bucket + directory portion
+	bucket, directory := f.split(dir)
+
+	// 1) Check Permission
+	//    - If `directory != ""`, we’re removing a subfolder => pass directory
+	//    - If `directory == ""` but bucket != "", we’re removing the entire bucket => pass an empty folderPath
+	if directory != "" {
+		// Removing a subfolder
+		if err := f.permHelper.CheckPermission(ctx, "remove", bucket, directory); err != nil {
+			return err
+		}
+	} else if bucket != "" {
+		// Removing the entire bucket (assuming your microservice checks "remove" for that too)
+		if err := f.permHelper.CheckPermission(ctx, "remove", bucket, ""); err != nil {
+			return err
+		}
+	}
+
+	// 2) If directory markers are enabled and we’re removing a subfolder,
+	//    remove the zero-byte object that indicates the “folder”.
+	if f.opt.DirectoryMarkers && bucket != "" && dir != "" {
+		o := &Object{
+			fs:     f,
+			remote: dir + "/",
+		}
+		fs.Debugf(o, "Removing directory marker")
+		err := o.Remove(ctx)
+		if err != nil {
+			return fmt.Errorf("removing directory marker failed: %w", err)
+		}
+	}
+
+	// 3) If either bucket is empty or there’s still a directory portion,
+	//    we’re done. The code below only runs if we want to remove the entire bucket.
+	if bucket == "" || directory != "" {
+		return nil
+	}
+
+	// 4) If we get here, it means directory == "" but bucket != "" => remove the bucket itself
 	return f.cache.Remove(bucket, func() error {
 		req := s3.DeleteBucketInput{
 			Bucket: &bucket,
@@ -5108,7 +5225,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 var commandHelp = []fs.CommandHelp{{
 	Name:  "restore",
 	Short: "Restore objects from GLACIER or INTELLIGENT-TIERING archive tier",
-	Long: `This command can be used to restore one or more objects from GLACIER to normal storage 
+	Long: `This command can be used to restore one or more objects from GLACIER to normal storage
 or from INTELLIGENT-TIERING Archive Access / Deep Archive Access tier to the Frequent Access tier.
 
 Usage Examples:
@@ -6706,8 +6823,10 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options [
 	return ui, nil
 }
 
+//Updated by Marwan Zakhia (18/03/2025)
 // Update the Object from in with modTime and size
-func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+// MZ: comment out the existing function
+/*func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	if o.fs.opt.VersionAt.IsSet() {
 		return errNotWithVersionAt
 	}
@@ -6782,10 +6901,101 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		fs.Debugf(o, "Multipart upload Etag: %s OK", wantETag)
 	}
 	return err
+}*/
+
+// MZ: Add the updated function (calling Checkpermission)
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	// 1) Derive the folder path for permission checks
+	//    Suppose your Fs struct has something like a `rootDirectory` or `rootBucket`.
+	//    We'll assume `o.fs.rootBucket` is the bucket, and we build a folder path using `o.remote`.
+	folderPath := path.Join(o.fs.rootDirectory, o.remote)
+	folderPath = strings.Trim(folderPath, "/") // remove leading/trailing slashes if needed
+
+	// 2) Call CheckPermission with the action "put" (or "update" if your microservice logic has that).
+	//    In your code snippet for `Put`, you used "put." You can do the same here,
+	//    or if you prefer a separate permission action for updating an existing object, use "update."
+	if err := o.fs.permHelper.CheckPermission(ctx, "put", o.fs.rootBucket, folderPath); err != nil {
+		return err
+	}
+
+	// 3) Continue with the original upload logic.
+	//    The rest is unchanged from your snippet.
+
+	if o.fs.opt.VersionAt.IsSet() {
+		return errNotWithVersionAt
+	}
+	size := src.Size()
+	multipart := size < 0 || size >= int64(o.fs.opt.UploadCutoff)
+
+	var wantETag string
+	var gotETag string
+	var lastModified time.Time
+	var versionID *string
+	var err error
+	var ui uploadInfo
+
+	if multipart {
+		wantETag, gotETag, versionID, ui, err = o.uploadMultipart(ctx, src, in, options...)
+	} else {
+		ui, err = o.prepareUpload(ctx, src, options, false)
+		if err != nil {
+			return fmt.Errorf("failed to prepare upload: %w", err)
+		}
+
+		if o.fs.opt.UsePresignedRequest {
+			gotETag, lastModified, versionID, err = o.uploadSinglepartPresignedRequest(ctx, ui.req, size, in)
+		} else {
+			gotETag, lastModified, versionID, err = o.uploadSinglepartPutObject(ctx, ui.req, size, in)
+		}
+	}
+	if err != nil {
+		return err
+	}
+
+	if o.fs.opt.Versions || o.fs.opt.VersionAt.IsSet() {
+		o.versionID = versionID
+	} else {
+		o.versionID = nil
+	}
+
+	var head *s3.HeadObjectOutput
+	if o.fs.opt.NoHead && size >= 0 {
+		head = new(s3.HeadObjectOutput)
+		setFrom_s3HeadObjectOutput_s3PutObjectInput(head, ui.req)
+		head.ETag = &ui.md5sumHex
+		head.ContentLength = &size
+		if gotETag != "" {
+			head.ETag = &gotETag
+		}
+		if lastModified.IsZero() {
+			lastModified = time.Now()
+		}
+		head.LastModified = &lastModified
+		head.VersionId = versionID
+	} else {
+		o.meta = nil
+		head, err = o.headObject(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	o.setMetaData(head)
+
+	if o.fs.opt.UseMultipartEtag.Value && !o.fs.etagIsNotMD5 && wantETag != "" && head.ETag != nil && *head.ETag != "" {
+		gotETag := strings.Trim(strings.ToLower(*head.ETag), `"`)
+		if wantETag != gotETag {
+			return fmt.Errorf("multipart upload corrupted: Etag differ: expecting %s but got %s", wantETag, gotETag)
+		}
+		fs.Debugf(o, "Multipart upload Etag: %s OK", wantETag)
+	}
+
+	return err
 }
 
+//Updated by Marwan Zakhia (18/03/2025)
 // Remove an object
-func (o *Object) Remove(ctx context.Context) error {
+// MZ: comment out the existing code
+/*func (o *Object) Remove(ctx context.Context) error {
 	if o.fs.opt.VersionAt.IsSet() {
 		return errNotWithVersionAt
 	}
@@ -6798,6 +7008,43 @@ func (o *Object) Remove(ctx context.Context) error {
 	if o.fs.opt.RequesterPays {
 		req.RequestPayer = types.RequestPayerRequester
 	}
+	err := o.fs.pacer.Call(func() (bool, error) {
+		_, err := o.fs.c.DeleteObject(ctx, &req)
+		return o.fs.shouldRetry(ctx, err)
+	})
+	return err
+}*/
+//MZ: add the updated function with permissions
+// Remove deletes the underlying object in the bucket.
+func (o *Object) Remove(ctx context.Context) error {
+	if o.fs.opt.VersionAt.IsSet() {
+		return errNotWithVersionAt
+	}
+
+	// 1) Derive the folder path for permission checks.
+	//    Suppose you have a "rootDirectory" concept. If not, adjust accordingly.
+	//    We'll assume o.remote is the relative path, which you join with rootDirectory.
+	folderPath := path.Join(o.fs.rootDirectory, o.remote)
+	folderPath = strings.Trim(folderPath, "/") // remove leading/trailing slashes if needed
+
+	// 2) Check permission before attempting to remove.
+	//    Pass "remove" as the action, the relevant bucket, and the derived folderPath.
+	if err := o.fs.permHelper.CheckPermission(ctx, "remove", o.fs.rootBucket, folderPath); err != nil {
+		return err
+	}
+
+	// 3) If permission is granted, proceed with the actual S3 delete.
+	bucket, bucketPath := o.split()
+	req := s3.DeleteObjectInput{
+		Bucket:    &bucket,
+		Key:       &bucketPath,
+		VersionId: o.versionID,
+	}
+	if o.fs.opt.RequesterPays {
+		req.RequestPayer = types.RequestPayerRequester
+	}
+
+	// Use pacing/retry logic
 	err := o.fs.pacer.Call(func() (bool, error) {
 		_, err := o.fs.c.DeleteObject(ctx, &req)
 		return o.fs.shouldRetry(ctx, err)
