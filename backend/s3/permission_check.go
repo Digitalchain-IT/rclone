@@ -881,6 +881,7 @@ func (h *Helper) CheckPermission(ctx context.Context, action, bucket, folderPath
 
 	//---------------------------------------------------------------------------
 	case "put", "copy":
+
 		parentPath, _ := splitOffLastSegment(folderPath)
 		if parentPath == "" {
 			// user is at top-level
@@ -890,28 +891,30 @@ func (h *Helper) CheckPermission(ctx context.Context, action, bucket, folderPath
 			// For simplicity, just always allow for single-segment "folder" creation:
 			return nil
 		}
-
-		// If we have a parent path, fetch parent's role
-		parentID, parentRole, e := h.fetchFolderIDAndRole(ctx, parentPath, token)
-		if e != nil {
-			if errors.Is(e, ErrPermissionDenied) {
-				return e
+		/*
+			// If we have a parent path, fetch parent's role
+			parentID, parentRole, e := h.fetchFolderIDAndRole(ctx, parentPath, token)
+			if e != nil {
+				if errors.Is(e, ErrPermissionDenied) {
+					return e
+				}
+				return fmt.Errorf("fetch parent ID/role: %w", e)
 			}
-			return fmt.Errorf("fetch parent ID/role: %w", e)
-		}
-		if parentID == "" {
-			return ErrPermissionDenied
-		}
-		if parentRole != "EDITOR" && parentRole != "FULL" && parentRole != "OWNER" {
-			return ErrPermissionDenied
-		}
+			if parentID == "" {
+				return ErrPermissionDenied
+			}
+			if parentRole != "EDITOR" && parentRole != "FULL" && parentRole != "OWNER" {
+				return ErrPermissionDenied
+			}
 
-		// Optionally auto-create the subfolder record
-		//  _, e2 := h.createFolderRecord(ctx, token, parentID, finalSegment, false)
-		//  if e2 != nil {
-		//    log.Printf("[CheckPermission] => createFolder => error => %v", e2)
-		//  return ErrPermissionDenied
-		//  }
+			// Optionally auto-create the subfolder record
+			//  _, e2 := h.createFolderRecord(ctx, token, parentID, finalSegment, false)
+			//  if e2 != nil {
+			//    log.Printf("[CheckPermission] => createFolder => error => %v", e2)
+			//  return ErrPermissionDenied
+			//  }
+
+		*/
 		return nil
 
 	//---------------------------------------------------------------------------
